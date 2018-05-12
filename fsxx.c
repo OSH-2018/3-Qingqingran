@@ -4,7 +4,7 @@
 #define FUSE_USE_VERSION 26
 #include <fuse.h>
 #include <sys/mman.h>
-#include "oshfs.h"
+#include "fsxx.h"
 
 typedef unsigned long long ull;
 
@@ -84,6 +84,18 @@ void index_add(ull num){
     (((ull *)mem[1 + BMBLOCK_NUM + i / (ULL_NUM)])[i % (ULL_NUM)]) = num;
 }
 
+// 文件目录删减
+void index_delete(ull num){
+    ull i = 0;
+    while((((ull *)mem[1 + BMBLOCK_NUM + i / (ULL_NUM)])[i % (ULL_NUM)]) != num)
+        i++;
+    ull j = i;
+    while((((ull *)mem[1 + BMBLOCK_NUM + (i + 1) / (ULL_NUM)])[(i + 1) % (ULL_NUM)]) != 0)
+        i++;
+    ((ull *)mem[1 + BMBLOCK_NUM + j / (ULL_NUM)])[j % (ULL_NUM)] = ((ull *)mem[1 + BMBLOCK_NUM + i / (ULL_NUM)])[i % (ULL_NUM)];
+    ((ull *)mem[1 + BMBLOCK_NUM + i / (ULL_NUM)])[i % (ULL_NUM)] = 0;
+}
+
 // 寻找开始读或写的块编号和位置
 void search_wrblock(ull start_num, size_t offset, ull * dest_num, off_t * dest_place){
     ull len;
@@ -94,6 +106,18 @@ void search_wrblock(ull start_num, size_t offset, ull * dest_num, off_t * dest_p
     for (ull i = 0; i < len; i++){
         *dest_num = ((ull *)mem[*dest_num])[ULL_NUM - 1];  
     }    
+}
+
+// 删除某块之后关联的块
+void destroy_block(ull start_num){    
+    // 从该块开始逐个删除
+    while(start_num != 0){
+        ull temp_num = start_num;
+        data_block_t *data_block = (data_block_t *)mem[start_num];
+        start_num = data_block->chain_num;                
+        munmap(mem[temp_num], BLOCK_SIZE);
+        mark_block(temp_num, 0); // 标记该块的状态为未使用        
+    }
 }
 
 // 初始化文件系统信息
@@ -223,6 +247,42 @@ static int fsxx_write(const char *path, const char *buf, size_t size, off_t offs
     return size;
 }
 
+// 截断文件
+static int fsxx_truncate(const char *path, off_t size){
+    filenode *attr_block; 
+    ull attr_num;
+    // 先找到文件对应的属性块
+    if ((attr_num = get_attr_block(path , &attr_block)) == 0)
+        return -ENOENT;
+    // 若截断的位置在文件结束前
+    if (attr_block->st.st_size > size){ 
+        size_t s = 0; 
+        ull wdest;
+        off_t dest_place;      
+        // 先找到开始截断的块中的某位置做特殊删除处理
+        search_wrblock(attr_num, size, &wdest, &dest_place);
+        ull temp_dest = wdest;
+        if ((dest_place + 1) == CONTENT_SIZE){
+            dest_place = 0;    
+            wdest = ((data_block_t *)mem[temp_dest])->chain_num;
+            ((data_block_t *)mem[temp_dest])->chain_num = 0;
+        }
+        else
+            wdest = ((data_block_t *)mem[temp_dest])->chain_num;
+        // 从开始截断的块的下一个块开始删除
+        destroy_block(wdest);
+        // 文件大小发生改变
+        attr_block->st.st_size = size;
+    }
+    // 若截断的位置在文件结束后
+    else{
+        char *buf = (char *) malloc(sizeof(char) * (size - attr_block->st.st_size));
+        memset(buf, 0, (size - attr_block->st.st_size));
+        fsxx_write(path, buf, (size - attr_block->st.st_size), attr_block->st.st_size, NULL);
+    }
+    return 0;
+}
+
 static int fsxx_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     filenode *attr_block;
     ull attr_num;
@@ -250,7 +310,7 @@ static int fsxx_read(const char *path, char *buf, size_t size, off_t offset, str
             dest_place = CONTENT_SIZE - 1;
             s += length;
         }
-        // 若会到文件尾部
+        // 若要读到文件尾部
         else{
             length = min((size - s) , (attr_block->st.st_size - s));
             memcpy(buf + s, &((data_block_t *)mem[wdest])->file_data[0], length);
@@ -261,6 +321,17 @@ static int fsxx_read(const char *path, char *buf, size_t size, off_t offset, str
     return s;    
 }
 
+// 删除文件
+static int fsxx_unlink(const char *path){
+    ull attr_num;
+    filenode *attr_block;
+    if((attr_num = get_attr_block(path, &attr_block)) == 0)
+        return -ENOENT;
+    index_delete(attr_num); // 删除该文件的目录项
+    destroy_block(attr_num); // 删除该文件的所有块
+    return 0;
+}
+
 static const struct fuse_operations op = {
     .init = fsxx_init,
     .getattr = fsxx_getattr,
@@ -268,9 +339,9 @@ static const struct fuse_operations op = {
     .mknod = fsxx_mknod,
     .open = fsxx_open,
     .write = fsxx_write,
-    // .truncate = fsxx_truncate,
+    .truncate = fsxx_truncate,
     .read = fsxx_read,
-    //.unlink = fsxx_unlink,
+    .unlink = fsxx_unlink,
 };
 
 int main(int argc, char *argv[]){
