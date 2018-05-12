@@ -52,8 +52,10 @@ ull find_free(){
     ull i = 0;
     ull j = ~i;
     ull free_num;
-    while((((ull *)mem[1 + (i / (8 * sizeof(ull))) / (ULL_NUM)])[(i / (8 * sizeof(ull))) % (ULL_NUM)]) == j)
+    while((i < BLOCK_NUM) && ((((ull *)mem[1 + (i / (8 * sizeof(ull))) / (ULL_NUM)])[(i / (8 * sizeof(ull))) % (ULL_NUM)]) == j))
         i += 8 * sizeof(ull);
+    if(i == BLOCK_NUM)
+        return 0;
     free_num = i + __builtin_ctzll(~(((ull *)mem[1 + (i / (8 * sizeof(ull))) / (ULL_NUM)])[(i / (8 * sizeof(ull))) % (ULL_NUM)]));
     return free_num;
 }
@@ -233,7 +235,8 @@ static int fsxx_write(const char *path, const char *buf, size_t size, off_t offs
             dest_place = 0;
             // 判读是否要分新的块
             if ((((data_block_t *)mem[wdest])->chain_num) == 0)
-                ((data_block_t *)mem[wdest])->chain_num = create_block();
+                if ((((data_block_t *)mem[wdest])->chain_num = create_block()) == 0)
+                    return -ENOSPC;
             wdest = ((data_block_t *)mem[wdest])->chain_num;                
         }             
         else
@@ -262,13 +265,8 @@ static int fsxx_truncate(const char *path, off_t size){
         // 先找到开始截断的块中的某位置做特殊删除处理
         search_wrblock(attr_num, size, &wdest, &dest_place);
         ull temp_dest = wdest;
-        if ((dest_place + 1) == CONTENT_SIZE){
-            dest_place = 0;    
-            wdest = ((data_block_t *)mem[temp_dest])->chain_num;
-            ((data_block_t *)mem[temp_dest])->chain_num = 0;
-        }
-        else
-            wdest = ((data_block_t *)mem[temp_dest])->chain_num;
+        wdest = ((data_block_t *)mem[temp_dest])->chain_num;
+        ((data_block_t *)mem[temp_dest])->chain_num = 0;
         // 从开始截断的块的下一个块开始删除
         destroy_block(wdest);
         // 文件大小发生改变
@@ -278,7 +276,8 @@ static int fsxx_truncate(const char *path, off_t size){
     else{
         char *buf = (char *) malloc(sizeof(char) * (size - attr_block->st.st_size));
         memset(buf, 0, (size - attr_block->st.st_size));
-        fsxx_write(path, buf, (size - attr_block->st.st_size), attr_block->st.st_size, NULL);
+        if ((fsxx_write(path, buf, (size - attr_block->st.st_size), attr_block->st.st_size, NULL)) == -ENOSPC)
+            return -ENOSPC;
     }
     return 0;
 }
